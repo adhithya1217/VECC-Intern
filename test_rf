@@ -1,0 +1,213 @@
+"""
+test_rf_tstr_unlabeled.py
+
+Batch-tests the TSTR-trained RF model (rf_model_best.pkl, from
+train_rf_tstr_gridsearch.py) against multiple unlabeled
+CICFlowMeter-style CSV files.
+
+Uses the SAME feature representation that model was trained on:
+  - feature columns = numerical_cols (from wgan_gp_numerical_cols_protocol.pkl) + "Protocol"
+  - Protocol is coerced to a numeric code, NOT one-hot encoded
+  - numerical_cols are scaled with the MinMaxScaler that was fit on the
+    synthetic training data (tstr_min_max_scaler.pkl); Protocol is left
+    unscaled, matching how it was trained
+
+This is a different feature pipeline than the production
+ids2018-rf-smote-multiclass.pkl model uses (that one one-hot encodes
+Protocol into Protocol_0/17/6 columns) - don't mix the two models'
+scalers/pickles.
+
+For each input CSV it writes a "<name>_predictions.csv" with every
+surviving original row plus a Prediction column, prints a per-file
+class count, and finally prints/saves an overall count across all files.
+"""
+
+import os
+import pickle
+import numpy as np
+import pandas as pd
+
+# ----------------------------------------------------------------
+# CONFIG — edit these paths
+# ----------------------------------------------------------------
+MODEL_PATH = r"rf_model_best.pkl"
+SCALER_PATH = r"tstr_min_max_scaler.pkl"
+NUMERICAL_COLS_PKL = r"wgan_gp_numerical_cols_protocol.pkl"
+TEST_DIR = r"C:\path\to\unlabeled_test_csvs"   # folder with your many unlabeled CSVs
+OUTPUT_DIR = r"C:\path\to\predictions_output"
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# ----------------------------------------------------------------
+# Same rename map as the production script (raw CICFlowMeter -> short
+# names). rename() silently skips any column that isn't present, so
+# this is safe to apply even if your unlabeled CSVs already use short
+# names.
+# ----------------------------------------------------------------
+COLUMN_RENAME = {
+    'Total Fwd Packet': 'Tot Fwd Pkts',
+    'Total Bwd packets': 'Tot Bwd Pkts',
+    'Total Length of Fwd Packet': 'TotLen Fwd Pkts',
+    'Total Length of Bwd Packet': 'TotLen Bwd Pkts',
+    'Fwd Packet Length Max': 'Fwd Pkt Len Max',
+    'Fwd Packet Length Min': 'Fwd Pkt Len Min',
+    'Fwd Packet Length Mean': 'Fwd Pkt Len Mean',
+    'Fwd Packet Length Std': 'Fwd Pkt Len Std',
+    'Bwd Packet Length Max': 'Bwd Pkt Len Max',
+    'Bwd Packet Length Min': 'Bwd Pkt Len Min',
+    'Bwd Packet Length Mean': 'Bwd Pkt Len Mean',
+    'Bwd Packet Length Std': 'Bwd Pkt Len Std',
+    'Flow Bytes/s': 'Flow Byts/s',
+    'Flow Packets/s': 'Flow Pkts/s',
+    'Fwd IAT Total': 'Fwd IAT Tot',
+    'Bwd IAT Total': 'Bwd IAT Tot',
+    'Fwd Header Length': 'Fwd Header Len',
+    'Bwd Header Length': 'Bwd Header Len',
+    'Fwd Packets/s': 'Fwd Pkts/s',
+    'Bwd Packets/s': 'Bwd Pkts/s',
+    'Packet Length Min': 'Pkt Len Min',
+    'Packet Length Max': 'Pkt Len Max',
+    'Packet Length Mean': 'Pkt Len Mean',
+    'Packet Length Std': 'Pkt Len Std',
+    'Packet Length Variance': 'Pkt Len Var',
+    'FIN Flag Count': 'FIN Flag Cnt',
+    'SYN Flag Count': 'SYN Flag Cnt',
+    'RST Flag Count': 'RST Flag Cnt',
+    'PSH Flag Count': 'PSH Flag Cnt',
+    'ACK Flag Count': 'ACK Flag Cnt',
+    'URG Flag Count': 'URG Flag Cnt',
+    'CWR Flag Count': 'CWE Flag Count',
+    'ECE Flag Count': 'ECE Flag Cnt',
+    'Average Packet Size': 'Pkt Size Avg',
+    'Fwd Segment Size Avg': 'Fwd Seg Size Avg',
+    'Bwd Segment Size Avg': 'Bwd Seg Size Avg',
+    'Fwd Bytes/Bulk Avg': 'Fwd Byts/b Avg',
+    'Fwd Packet/Bulk Avg': 'Fwd Pkts/b Avg',
+    'Fwd Bulk Rate Avg': 'Fwd Blk Rate Avg',
+    'Bwd Bytes/Bulk Avg': 'Bwd Byts/b Avg',
+    'Bwd Packet/Bulk Avg': 'Bwd Pkts/b Avg',
+    'Bwd Bulk Rate Avg': 'Bwd Blk Rate Avg',
+    'Subflow Fwd Packets': 'Subflow Fwd Pkts',
+    'Subflow Fwd Bytes': 'Subflow Fwd Byts',
+    'Subflow Bwd Packets': 'Subflow Bwd Pkts',
+    'Subflow Bwd Bytes': 'Subflow Bwd Byts',
+    'FWD Init Win Bytes': 'Init Fwd Win Byts',
+    'Bwd Init Win Bytes': 'Init Bwd Win Byts',
+}
+
+
+def build_feature_frame(df, numerical_cols):
+    """Select numerical_cols + Protocol and coerce Protocol to numeric.
+    Identical to the function used in train_rf_tstr_gridsearch.py - keep
+    these in sync if either one changes."""
+    feature_cols = numerical_cols + ["Protocol"]
+    X = df[feature_cols].copy()
+    X["Protocol"] = pd.to_numeric(X["Protocol"], errors="coerce")
+    return X
+
+
+def preprocess(df, numerical_cols, scaler):
+    """Clean + select + scale one dataframe to match TSTR training.
+    Returns (surviving_df, X) with matching index, or (df, None) if
+    nothing usable."""
+    df = df.rename(columns=COLUMN_RENAME)
+
+    feature_cols = numerical_cols + ["Protocol"]
+    missing = [c for c in feature_cols if c not in df.columns]
+    if missing:
+        print(f"  Warning: missing required columns, skipping file: {missing}")
+        return df, None
+
+    x = build_feature_frame(df, numerical_cols)
+    x = x.replace([np.inf, -np.inf], np.nan)
+
+    # Only check for nulls in the columns the model actually uses - a
+    # stray null in an unused column (Flow ID, Timestamp, etc.) shouldn't
+    # cost you an otherwise-usable row.
+    valid_mask = x.notna().all(axis=1)
+    df = df.loc[valid_mask]
+    x = x.loc[valid_mask]
+
+    if x.empty:
+        return df, None
+
+    # De-duplicate on the feature values actually fed to the model,
+    # rather than the entire raw row.
+    dedup_mask = ~x.duplicated()
+    df = df.loc[dedup_mask]
+    x = x.loc[dedup_mask]
+
+    try:
+        x[numerical_cols] = scaler.transform(x[numerical_cols])
+    except Exception as e:
+        print(f"  Scaling error: {e}")
+        return df, None
+
+    return df, x
+
+
+def test_file(csv_path, model, scaler, numerical_cols, output_dir):
+    print(f"\nTesting file: {csv_path}")
+    raw_df = pd.read_csv(csv_path, low_memory=False)
+
+    clean_df, x_test = preprocess(raw_df, numerical_cols, scaler)
+
+    if x_test is None or x_test.empty:
+        print("  No usable rows after cleaning, skipping.")
+        return None
+
+    preds = model.predict(x_test)
+    clean_df = clean_df.copy()
+    clean_df['Prediction'] = preds
+
+    out_name = os.path.splitext(os.path.basename(csv_path))[0] + "_predictions.csv"
+    out_path = os.path.join(output_dir, out_name)
+    clean_df.to_csv(out_path, index=False)
+
+    counts = clean_df['Prediction'].value_counts()
+    print(f"  Rows tested: {len(clean_df)}")
+    print(counts.to_string())
+    print(f"  Saved -> {out_path}")
+
+    return counts
+
+
+def main():
+    with open(MODEL_PATH, 'rb') as f:
+        model = pickle.load(f)
+
+    with open(SCALER_PATH, 'rb') as f:
+        scaler = pickle.load(f)
+
+    with open(NUMERICAL_COLS_PKL, 'rb') as f:
+        numerical_cols = pickle.load(f)
+
+    csv_files = [f for f in os.listdir(TEST_DIR) if f.lower().endswith(".csv")]
+    if not csv_files:
+        print(f"No CSV files found in {TEST_DIR}")
+        return
+
+    overall_counts = pd.Series(dtype=float)
+
+    for fname in csv_files:
+        csv_path = os.path.join(TEST_DIR, fname)
+        try:
+            counts = test_file(csv_path, model, scaler, numerical_cols, OUTPUT_DIR)
+            if counts is not None:
+                overall_counts = overall_counts.add(counts, fill_value=0)
+        except Exception as e:
+            print(f"Error processing {fname}: {e}")
+
+    print("\n" + "=" * 60)
+    print("OVERALL PREDICTION SUMMARY ACROSS ALL FILES")
+    print("=" * 60)
+    overall_counts = overall_counts.sort_values(ascending=False)
+    print(overall_counts.to_string())
+
+    summary_path = os.path.join(OUTPUT_DIR, "overall_summary.csv")
+    overall_counts.to_csv(summary_path, header=["count"])
+    print(f"\nSummary saved -> {summary_path}")
+
+
+if __name__ == "__main__":
+    main()
